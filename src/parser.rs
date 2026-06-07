@@ -127,7 +127,7 @@ fn parse_ipv4(data: &[u8]) -> Result<Ipv4Packet<'_>, SnifferError> {
     })
 }
 
-// 🧠 核心新增：深度解构 TCP 首部
+// 核心新增：深度解构 TCP 首部
 fn parse_tcp(data: &[u8]) -> Result<TransportProtocol<'_>, SnifferError> {
     if data.len() < 20 {
         return Err(SnifferError::InvalidLength);
@@ -171,7 +171,7 @@ fn parse_tcp(data: &[u8]) -> Result<TransportProtocol<'_>, SnifferError> {
     }))
 }
 
-// 🧠 核心新增：深度解构 UDP 首部
+// 核心新增：深度解构 UDP 首部
 fn parse_udp(data: &[u8]) -> Result<TransportProtocol<'_>, SnifferError> {
     if data.len() < 8 {
         return Err(SnifferError::InvalidLength);

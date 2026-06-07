@@ -30,7 +30,7 @@ impl CaptureEngine {
                             break; // Channel 关闭则退出线程
                         }
                     }
-                    // 🌟 就在这里：把原本的 Timeout 改成 TimeoutExpired 
+                    // 就在这里：把原本的 Timeout 改成 TimeoutExpired
                     Err(pcap::Error::TimeoutExpired) => {
                         continue;
                     }
