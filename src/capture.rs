@@ -5,7 +5,8 @@ use crate::error::SnifferError;
 pub struct CaptureEngine;
 
 impl CaptureEngine {
-    pub fn start_capture(device_name: &str, tx: mpsc::Sender<Vec<u8>>) -> Result<(), SnifferError> {
+    //  升级接口：增加 filter_str 参数接收过滤规则字符串
+    pub fn start_capture(device_name: &str, filter_str: &str, tx: mpsc::Sender<Vec<u8>>) -> Result<(), SnifferError> {
         // 查找指定网卡
        let main_device = Device::list()?
         .into_iter()
@@ -19,9 +20,15 @@ impl CaptureEngine {
             .timeout(1000)
             .open()?;
 
+        //  核心硬核改动：如果用户输入了规则，直接将 BPF 表达式下发给操作系统内核
+        // 第二个参数 true 代表开启表达式底层编译优化
+        if !filter_str.is_empty() {
+            cap.filter(filter_str, true)?;
+        }
+
         // 开辟独立线程循环抓包
         std::thread::spawn(move || {
-            println!("[Capture] 后台抓包线程已启动...");
+            // 彻底移除此行的打印，防止破坏精美的全屏 TUI 面板
             
             loop {
                 match cap.next_packet() {
@@ -30,7 +37,6 @@ impl CaptureEngine {
                             break; // Channel 关闭则退出线程
                         }
                     }
-                    // 就在这里：把原本的 Timeout 改成 TimeoutExpired
                     Err(pcap::Error::TimeoutExpired) => {
                         continue;
                     }
@@ -40,7 +46,6 @@ impl CaptureEngine {
                     }
                 }
             }
-            println!("[Capture] 后台抓包线程已安全退出。");
         });
 
         Ok(())

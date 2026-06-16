@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use pcap::Device;
 use std::io::{self, stdout, Write};
 use std::time::Duration;
-use std::fs::File; // 🌟 新增：用于创建导出文件
+use std::fs::File;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crossterm::{
     event::{self, Event, KeyCode, MouseButton, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
@@ -16,59 +18,50 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Terminal,
 };
 
-// 定义清晰的用户级抓包状态机
 #[derive(PartialEq, Clone, Copy)]
 enum CaptureState {
-    Running, // 🟢 运行中
-    Paused,  // 🟡 已暂停
-    Stopped, // 🔴 已停止
+    Running, 
+    Paused,  
+    Stopped, 
 }
 
-// 🌟 核心硬核函数：手动构建标准 Libpcap 二进制文件格式 (Wireshark 官方格式)
 fn export_to_pcap(raw_packets: &[Vec<u8>]) -> std::io::Result<()> {
     let file_name = "rusty_shark.pcap";
     let mut file = File::create(file_name)?;
     
-    // 1. 写入 PCAP 全局文件头 (24 字节)
-    file.write_all(&0xa1b2c3d4u32.to_le_bytes())?; // Magic Number (标识小端序 pcap)
-    file.write_all(&2u16.to_le_bytes())?;          // Major Version (主版本号: 2)
-    file.write_all(&4u16.to_le_bytes())?;          // Minor Version (副版本号: 4)
-    file.write_all(&0i32.to_le_bytes())?;          // Timezone (当地时区修正: 0)
-    file.write_all(&0u32.to_le_bytes())?;          // Sigfigs (时间戳精度: 0)
-    file.write_all(&65535u32.to_le_bytes())?;      // Snaplen (最大捕获长度: 64KB)
-    file.write_all(&1u32.to_le_bytes())?;          // Network (链路层类型: 1 代表以太网 Ethernet)
+    file.write_all(&0xa1b2c3d4u32.to_le_bytes())?; 
+    file.write_all(&2u16.to_le_bytes())?;          
+    file.write_all(&4u16.to_le_bytes())?;          
+    file.write_all(&0i32.to_le_bytes())?;          
+    file.write_all(&0u32.to_le_bytes())?;          
+    file.write_all(&65535u32.to_le_bytes())?;      
+    file.write_all(&1u32.to_le_bytes())?;          
     
-    // 获取当前系统时间戳作为基础时间
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs() as u32;
     let usecs = now.subsec_micros() as u32;
 
-    // 2. 循环写入每一个数据包
     for packet in raw_packets {
         let len = packet.len() as u32;
-        // 写入每个数据包的专属头部 (16 字节)
-        file.write_all(&secs.to_le_bytes())?;      // 时间戳：秒
-        file.write_all(&usecs.to_le_bytes())?;     // 时间戳：微秒
-        file.write_all(&len.to_le_bytes())?;       // 捕获到的数据长度
-        file.write_all(&len.to_le_bytes())?;       // 报文原始真实长度
-        
-        // 写入数据包纯原始裸字节
+        file.write_all(&secs.to_le_bytes())?;      
+        file.write_all(&usecs.to_le_bytes())?;     
+        file.write_all(&len.to_le_bytes())?;       
+        file.write_all(&len.to_le_bytes())?;       
         file.write_all(packet)?;
     }
-    
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ----------------------------------------------------------------
-    // 1. 网卡交互选择
+    // 1. 网卡交互选择 + BPF 表达式获取
     // ----------------------------------------------------------------
     println!("=== RustyShark 智能网络嗅探器 ===");
     let devices = Device::list().expect("无法获取网卡列表");
@@ -86,6 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let index = if choice < devices.len() { choice } else { 0 };
     let target_device = devices[index].name.clone();
 
+    print!("请输入 BPF 过滤表达式 (直接回车不过滤，例如 'tcp'): ");
+    stdout().flush().unwrap();
+    let mut filter_input = String::new();
+    io::stdin().read_line(&mut filter_input).expect("读取过滤表达式失败");
+    let filter_str = filter_input.trim().to_string();
+
     // ----------------------------------------------------------------
     // 2. 初始化 TUI 全屏模式 + 鼠标捕获
     // ----------------------------------------------------------------
@@ -95,20 +94,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // 3. 启动通道
+    // ----------------------------------------------------------------
+    // 3. 启动双引擎通道
+    // ----------------------------------------------------------------
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1000);
-    if let Err(e) = capture::CaptureEngine::start_capture(&target_device, tx) {
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-        eprintln!("启动抓包失败: {:?}", e);
+    if let Err(e) = capture::CaptureEngine::start_capture(&target_device, &filter_str, tx) {
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = disable_raw_mode();
+        eprintln!("\n❌ 启动抓包失败 (BPF语法错误): {:?}", e);
         return Ok(());
     }
 
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+
     let (event_tx, mut event_rx) = mpsc::channel::<crossterm::event::Event>(100);
     std::thread::spawn(move || {
-        loop {
-            if let Ok(ev) = event::read() {
-                if event_tx.blocking_send(ev).is_err() { break; }
+        while running_clone.load(Ordering::SeqCst) {
+            if let Ok(true) = event::poll(Duration::from_millis(20)) {
+                if let Ok(ev) = event::read() {
+                    if event_tx.blocking_send(ev).is_err() { break; }
+                }
             }
         }
     });
@@ -118,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut selected_idx = 0;   
     let mut scroll_offset = 0;  
     let mut capture_state = CaptureState::Running; 
-    let mut info_message = String::new(); // 🌟 新增：界面动态系统提示弹窗文本
+    let mut info_message = String::new(); 
 
     // 30 FPS 控频定时器
     let mut fps_timer = tokio::time::interval(Duration::from_millis(33));
@@ -133,10 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3),      // 0: 顶部状态栏
-                        Constraint::Percentage(50), // 1: 中部滚动列表
-                        Constraint::Percentage(35), // 2: 协议深度解析
-                        Constraint::Length(3),      // 3: 底部鼠标按钮控制栏
+                        Constraint::Length(3),      
+                        Constraint::Percentage(50), 
+                        Constraint::Percentage(35), 
+                        Constraint::Length(3),      
                     ])
                     .split(f.size());
 
@@ -156,33 +162,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     CaptureState::Paused  => "🟡 已暂停",
                     CaptureState::Stopped => "🔴 已停止",
                 };
-                let status_text = format!(" 📡 监听网卡: {}  |  当前状态: {}  |  📦 已捕获: {} 包", target_device, state_str, raw_packets.len());
+                let status_text = format!("  监听网卡: {}  |  当前状态: {}  |   已捕获: {} 包", target_device, state_str, raw_packets.len());
                 let status_bar = Paragraph::new(status_text)
                     .block(Block::default().title("【 RustyShark 状态面板 】").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
                 f.render_widget(status_bar, chunks[0]);
 
-                // ② 中部滚动列表
+                // ② 中部滚动列表 核心精进：全自动致敬 Wireshark 的灵魂染色矩阵！
                 let mut list_items = Vec::new();
                 let start = scroll_offset;
                 let end = std::cmp::min(raw_packets.len(), scroll_offset + max_visible);
 
                 for idx in start..end {
                     let raw_data = &raw_packets[idx];
+                    let mut item_color = Color::White; // 默认初始化颜色
+                    
                     let brief = match parser::parse_ethernet(raw_data) {
                         Ok(frame) => match frame.payload {
                             parser::IpProtocol::Ipv4(ip) => {
-                                let proto = match ip.transport {
-                                    parser::TransportProtocol::Tcp(_) => "TCP",
-                                    parser::TransportProtocol::Udp(_) => "UDP",
-                                    parser::TransportProtocol::Unknown(_) => "IPv4",
-                                };
-                                format!("[{:03}] 协议: {:<5} | {} -> {}", idx + 1, proto, ip.src_ip, ip.dest_ip)
+                                match ip.transport {
+                                    parser::TransportProtocol::Tcp(tcp) => {
+                                        //  拦截 TCP RST 强制断开标志位
+                                        if tcp.flags.rst {
+                                            item_color = Color::Red; // 异常流：刺眼暗红色
+                                            format!("[{:03}] 协议: TCP(RST) | {} -> {} [异常断开连接]", idx + 1, ip.src_ip, ip.dest_ip)
+                                        } else {
+                                            item_color = Color::LightBlue; // 标准 TCP：经典淡蓝色
+                                            format!("[{:03}] 协议: TCP   | {} -> {}", idx + 1, ip.src_ip, ip.dest_ip)
+                                        }
+                                    },
+                                    parser::TransportProtocol::Udp(_) => {
+                                        item_color = Color::LightYellow; //  标准 UDP：经典淡黄色
+                                        format!("[{:03}] 协议: UDP   | {} -> {}", idx + 1, ip.src_ip, ip.dest_ip)
+                                    },
+                                    parser::TransportProtocol::Unknown(_) => {
+                                        item_color = Color::White;
+                                        format!("[{:03}] 协议: IPv4  | {} -> {}", idx + 1, ip.src_ip, ip.dest_ip)
+                                    },
+                                }
                             },
-                            parser::IpProtocol::Unknown => format!("[{:03}] 非IPv4帧 | MAC: {} -> {}", idx + 1, frame.src_mac, frame.dest_mac),
+                            parser::IpProtocol::Ipv6 => {
+                                item_color = Color::LightMagenta; //  IPv6 协议网络包：炫酷浅紫色
+                                format!("[{:03}] 协议: IPv6  | MAC: {} -> {}", idx + 1, frame.src_mac, frame.dest_mac)
+                            },
+                            parser::IpProtocol::Arp => {
+                                item_color = Color::LightGreen; //  ARP 局域网寻址广播包：生机淡绿色
+                                format!("[{:03}] 协议: ARP   | MAC: {} -> {}", idx + 1, frame.src_mac, frame.dest_mac)
+                            },
+                            parser::IpProtocol::Unknown(eth_type) => {
+                                item_color = Color::DarkGray; // 未知小众网络帧：沉稳暗灰色
+                                format!("[{:03}] 未知(0x{:04X}) | MAC: {} -> {}", idx + 1, eth_type, frame.src_mac, frame.dest_mac)
+                            },
                         },
-                        Err(_) => format!("[{:03}] 损坏的数据包", idx + 1),
+                        Err(_) => {
+                            item_color = Color::Red; //  驱动或链路解包损坏：刺眼暗红色
+                            format!("[{:03}] 损坏的数据包", idx + 1)
+                        },
                     };
-                    list_items.push(ListItem::new(brief));
+                    
+                    //  核心魔法：将动态计算出来的颜色灌注给当前的 ListItem
+                    list_items.push(ListItem::new(brief).style(Style::default().fg(item_color)));
                 }
 
                 let mut display_state = ListState::default();
@@ -191,10 +229,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let packet_list = List::new(list_items)
-                    .block(Block::default().title(" 📥 数据包瀑布流 (鼠标左键点击任意行可深度解剖) ").borders(Borders::ALL))
+                    .block(Block::default().title("  数据包瀑布流 (支持鼠标点击/拖拽滚动条) ").borders(Borders::ALL))
                     .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
                     .highlight_symbol("▶ ");
                 f.render_stateful_widget(packet_list, list_chunk, &mut display_state);
+
+                // 渲染滚动条外观
+                let scrollbar = Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight) 
+                    .begin_symbol(Some("▲")) 
+                    .end_symbol(Some("▼"))   
+                    .track_symbol(Some("│")) 
+                    .thumb_symbol("█");      
+
+                let mut scrollbar_state = ScrollbarState::new(raw_packets.len()).position(selected_idx);
+                f.render_stateful_widget(scrollbar, list_chunk, &mut scrollbar_state);
 
                 // ③ 下部：深度协议树解析栏
                 let details_text = if raw_packets.is_empty() {
@@ -230,8 +279,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 },
-                                parser::IpProtocol::Unknown => {
-                                    tree.push_str(" └─ [Layer 3] 非 IPv4 协议，停止递进解析");
+                                parser::IpProtocol::Ipv6 => {
+                                    tree.push_str(" └─ [Layer 3] 互联网协议第六版 (IPv6) | 后台内核已基于 BPF 规则完成筛选");
+                                },
+                                parser::IpProtocol::Arp => {
+                                    tree.push_str(" └─ [Layer 3] 地址解析协议 (ARP) | 用于局域网内 IP 与 MAC 地址的动态映射寻址");
+                                },
+                                parser::IpProtocol::Unknown(eth_type) => {
+                                    tree.push_str(&format!(" └─ [Layer 3] 未知上层网络协议 (EtherType: 0x{:04X})，停止递进解析", eth_type));
                                 }
                             }
                             tree
@@ -243,63 +298,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .block(Block::default().title(" ⚙️ 协议树深度明细 ").borders(Borders::ALL).border_style(Style::default().fg(Color::Green)));
                 f.render_widget(details_panel, chunks[2]);
 
-                // ④ 🌟 按钮网格：横向均匀拆分出 6 个整齐的控制格
+                // ④ 按钮控制网格
                 let btn_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Length(16), // [ ▶ 开始/恢复 ]
+                        Constraint::Length(16), 
                         Constraint::Length(1),  
-                        Constraint::Length(16), // [ ⏸ 暂停抓包 ]
+                        Constraint::Length(16), 
                         Constraint::Length(1),  
-                        Constraint::Length(16), // [ ⏹ 停止抓包 ]
+                        Constraint::Length(16), 
                         Constraint::Length(1),  
-                        Constraint::Length(16), // [  一键清空  ]
+                        Constraint::Length(16), 
                         Constraint::Length(1),  
-                        Constraint::Length(16), // [ 💾 导出文件 ] 🌟 新增按钮位置
+                        Constraint::Length(16), 
                         Constraint::Length(1),  
-                        Constraint::Length(16), // [ ❌ 退出程序 ]
+                        Constraint::Length(16), 
                         Constraint::Min(0),     
                     ])
                     .split(chunks[3]);
 
-                // 按钮 1：开始/恢复
                 let start_style = if capture_state == CaptureState::Running { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
                 let btn_start = Paragraph::new("  ▶ 开始/恢复 ")
                     .block(Block::default().borders(Borders::ALL).border_style(start_style));
                 f.render_widget(btn_start, btn_chunks[0]);
 
-                // 按钮 2：暂停
                 let pause_style = if capture_state == CaptureState::Paused { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
                 let btn_pause = Paragraph::new("  ⏸ 暂停抓包 ")
                     .block(Block::default().borders(Borders::ALL).border_style(pause_style));
                 f.render_widget(btn_pause, btn_chunks[2]);
 
-                // 按钮 3：终止
                 let stop_style = if capture_state == CaptureState::Stopped { Style::default().fg(Color::Red).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
                 let btn_stop = Paragraph::new("  ⏹ 停止抓包 ")
                     .block(Block::default().borders(Borders::ALL).border_style(stop_style));
                 f.render_widget(btn_stop, btn_chunks[4]);
 
-                // 按钮 4：一键清空
                 let clear_style = if capture_state != CaptureState::Running && !raw_packets.is_empty() { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
                 let btn_clear = Paragraph::new("    一键清空   ")
                     .block(Block::default().borders(Borders::ALL).border_style(clear_style));
                 f.render_widget(btn_clear, btn_chunks[6]);
 
-                // 按钮 5：🌟 导出文件按钮渲染
                 let export_style = if !raw_packets.is_empty() { Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
-                let btn_export = Paragraph::new("  💾 导出文件 ")
+                let btn_export = Paragraph::new("   导出文件 ")
                     .block(Block::default().borders(Borders::ALL).border_style(export_style));
                 f.render_widget(btn_export, btn_chunks[8]);
 
-                // 按钮 6：退出程序
                 let btn_quit = Paragraph::new("  ❌ 退出程序 ")
                     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::LightRed)));
                 f.render_widget(btn_quit, btn_chunks[10]);
 
-                // 右侧动态系统提示弹窗区
                 let tip_text = if info_message.is_empty() {
-                    "  💡 提示：使用鼠标左键点击下方按钮操作。".to_string()
+                    "  💡 提示：使用鼠标左键点击或按住拖拽右侧滚动条。".to_string()
                 } else {
                     format!("  ✨ 状态反馈: {}", info_message)
                 };
@@ -311,13 +359,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             should_redraw = false;
         }
 
-        // 🧠 异步多路复用
         tokio::select! {
             _ = fps_timer.tick() => {
                 should_redraw = true;
             }
 
-            // 流量注入
             Some(raw_data) = rx.recv() => {
                 if capture_state == CaptureState::Running {
                     let old_len = raw_packets.len();
@@ -341,7 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     Event::Mouse(mouse) => {
                         match mouse.kind {
-                            MouseEventKind::Down(MouseButton::Left) => {
+                            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                                 if let Ok(size) = terminal.size() {
                                     let layout_chunks = Layout::default()
                                         .direction(Direction::Vertical)
@@ -356,95 +402,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let list_chunk = layout_chunks[1];
                                     let max_visible = (list_chunk.height as usize).saturating_sub(2);
 
-                                    // A 面板：戳中数据列表
-                                    if mouse.row > list_chunk.y && mouse.row < list_chunk.y + list_chunk.height - 1
-                                       && mouse.column > list_chunk.x && mouse.column < list_chunk.x + list_chunk.width - 1
+                                    if mouse.column == list_chunk.x + list_chunk.width - 1
+                                       && mouse.row >= list_chunk.y && mouse.row < list_chunk.y + list_chunk.height
                                     {
-                                        let clicked_visible_idx = (mouse.row - list_chunk.y - 1) as usize;
-                                        let target_idx = scroll_offset + clicked_visible_idx;
-                                        let current_end = std::cmp::min(raw_packets.len(), scroll_offset + max_visible);
-                                        if target_idx < current_end {
-                                            selected_idx = target_idx;
-                                        }
-                                    }
-
-                                    // B 面板：🌟 精准解算点击 6 个按钮
-                                    let btn_bar_chunk = layout_chunks[3];
-                                    if mouse.row >= btn_bar_chunk.y && mouse.row < btn_bar_chunk.y + btn_bar_chunk.height {
-                                        let sub_btn_chunks = Layout::default()
-                                            .direction(Direction::Horizontal)
-                                            .constraints([
-                                                Constraint::Length(16), // 0: 开始
-                                                Constraint::Length(1),
-                                                Constraint::Length(16), // 2: 暂停
-                                                Constraint::Length(1),
-                                                Constraint::Length(16), // 4: 停止
-                                                Constraint::Length(1),
-                                                Constraint::Length(16), // 6: 清空
-                                                Constraint::Length(1),
-                                                Constraint::Length(16), // 8: 导出 🌟 新增
-                                                Constraint::Length(1),
-                                                Constraint::Length(16), // 10: 退出
-                                                Constraint::Min(0),
-                                            ])
-                                            .split(btn_bar_chunk);
-
-                                        let click_col = mouse.column;
-
-                                        // ① 点击“开始/恢复”
-                                        let b_start = sub_btn_chunks[0];
-                                        if click_col >= b_start.x && click_col < b_start.x + b_start.width {
-                                            capture_state = CaptureState::Running;
-                                            info_message = "监听引擎已唤醒，正在捕获最新流量...".to_string();
-                                        }
-
-                                        // ② 点击“暂停抓包”
-                                        let b_pause = sub_btn_chunks[2];
-                                        if click_col >= b_pause.x && click_col < b_pause.x + b_pause.width {
-                                            if capture_state == CaptureState::Running {
-                                                capture_state = CaptureState::Paused;
-                                                info_message = "抓包已暂停，你可以自由翻阅和导出当前数据。".to_string();
-                                            }
-                                        }
-
-                                        // ③ 点击“停止抓包”
-                                        let b_stop = sub_btn_chunks[4];
-                                        if click_col >= b_stop.x && click_col < b_stop.x + b_stop.width {
-                                            capture_state = CaptureState::Stopped;
-                                            info_message = "抓包已彻底终止。".to_string();
-                                        }
-
-                                        // ④ 点击“一键清空”
-                                        let b_clear = sub_btn_chunks[6];
-                                        if click_col >= b_clear.x && click_col < b_clear.x + b_clear.width {
-                                            if capture_state != CaptureState::Running {
-                                                raw_packets.clear();
-                                                selected_idx = 0;
-                                                scroll_offset = 0;
-                                                info_message = "缓冲区已清空，系统重置归零。".to_string();
+                                        if !raw_packets.is_empty() {
+                                            let total_packets = raw_packets.len();
+                                            if mouse.row == list_chunk.y {
+                                                if selected_idx > 0 { selected_idx -= 1; }
+                                            } else if mouse.row == list_chunk.y + list_chunk.height - 1 {
+                                                if selected_idx < total_packets - 1 { selected_idx += 1; }
                                             } else {
-                                                info_message = "⚠️ 警告：请先暂停或停止抓包再清空数据！".to_string();
-                                            }
-                                        }
-
-                                        // ⑤ 🌟 点击“导出文件”事件拦截
-                                        let b_export = sub_btn_chunks[8];
-                                        if click_col >= b_export.x && click_col < b_export.x + b_export.width {
-                                            if raw_packets.is_empty() {
-                                                info_message = "❌ 导出失败：当前没有任何捕获到的包数据！".to_string();
-                                            } else {
-                                                // 执行二进制级 pcap 文件导出
-                                                match export_to_pcap(&raw_packets) {
-                                                    Ok(_) => info_message = "💾 成功导出标准文件: rusty_shark.pcap !".to_string(),
-                                                    Err(e) => info_message = format!("❌ 导出文件系统出错: {:?}", e),
+                                                let track_height = list_chunk.height.saturating_sub(2) as f32;
+                                                if track_height > 1.0 {
+                                                    let rel_row = (mouse.row - list_chunk.y - 1) as f32;
+                                                    let progress = (rel_row / track_height).clamp(0.0, 1.0);
+                                                    let target = (progress * (total_packets - 1) as f32).round() as usize;
+                                                    selected_idx = target.min(total_packets - 1);
                                                 }
                                             }
                                         }
+                                    }
+                                    else if mouse.row > list_chunk.y && mouse.row < list_chunk.y + list_chunk.height - 1
+                                       && mouse.column > list_chunk.x && mouse.column < list_chunk.x + list_chunk.width - 1
+                                    {
+                                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                            let clicked_visible_idx = (mouse.row - list_chunk.y - 1) as usize;
+                                            let target_idx = scroll_offset + clicked_visible_idx;
+                                            let current_end = std::cmp::min(raw_packets.len(), scroll_offset + max_visible);
+                                            if target_idx < current_end {
+                                                selected_idx = target_idx;
+                                            }
+                                        }
+                                    }
+                                    else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                        let btn_bar_chunk = layout_chunks[3];
+                                        if mouse.row >= btn_bar_chunk.y && mouse.row < btn_bar_chunk.y + btn_bar_chunk.height {
+                                            let sub_btn_chunks = Layout::default()
+                                                .direction(Direction::Horizontal)
+                                                .constraints([
+                                                    Constraint::Length(16), 
+                                                    Constraint::Length(1),
+                                                    Constraint::Length(16), 
+                                                    Constraint::Length(1),
+                                                    Constraint::Length(16), 
+                                                    Constraint::Length(1),
+                                                    Constraint::Length(16), 
+                                                    Constraint::Length(1),
+                                                    Constraint::Length(16), 
+                                                    Constraint::Length(1),
+                                                    Constraint::Length(16), 
+                                                    Constraint::Min(0),
+                                                ])
+                                                .split(btn_bar_chunk);
 
-                                        // ⑥ 点击“退出程序”
-                                        let b_quit = sub_btn_chunks[10];
-                                        if click_col >= b_quit.x && click_col < b_quit.x + b_quit.width {
-                                            break; 
+                                            let click_col = mouse.column;
+
+                                            let b_start = sub_btn_chunks[0];
+                                            if click_col >= b_start.x && click_col < b_start.x + b_start.width {
+                                                capture_state = CaptureState::Running;
+                                                info_message = "监听引擎已唤醒，正在捕获最新流量...".to_string();
+                                            }
+
+                                            let b_pause = sub_btn_chunks[2];
+                                            if click_col >= b_pause.x && click_col < b_pause.x + b_pause.width {
+                                                if capture_state == CaptureState::Running {
+                                                    capture_state = CaptureState::Paused;
+                                                    info_message = "抓包已暂停，你可以自由翻阅和导出当前数据。".to_string();
+                                                }
+                                            }
+
+                                            let b_stop = sub_btn_chunks[4];
+                                            if click_col >= b_stop.x && click_col < b_stop.x + b_stop.width {
+                                                capture_state = CaptureState::Stopped;
+                                                info_message = "抓包已彻底终止。".to_string();
+                                            }
+
+                                            let b_clear = sub_btn_chunks[6];
+                                            if click_col >= b_clear.x && click_col < b_clear.x + b_clear.width {
+                                                if capture_state != CaptureState::Running {
+                                                    raw_packets.clear();
+                                                    selected_idx = 0;
+                                                    scroll_offset = 0;
+                                                    info_message = "缓冲区已清空，系统重置归零。".to_string();
+                                                } else {
+                                                    info_message = "⚠️ 警告：请先暂停或停止抓包再清空数据！".to_string();
+                                                }
+                                            }
+
+                                            let b_export = sub_btn_chunks[8];
+                                            if click_col >= b_export.x && click_col < b_export.x + b_export.width {
+                                                if raw_packets.is_empty() {
+                                                    info_message = "❌ 导出失败：当前没有任何捕获到的包数据！".to_string();
+                                                } else {
+                                                    match export_to_pcap(&raw_packets) {
+                                                        Ok(_) => info_message = "💾 成功导出标准文件: rusty_shark.pcap !".to_string(),
+                                                        Err(e) => info_message = format!("❌ 导出文件系统出错: {:?}", e),
+                                                    }
+                                                }
+                                            }
+
+                                            let b_quit = sub_btn_chunks[10];
+                                            if click_col >= b_quit.x && click_col < b_quit.x + b_quit.width {
+                                                break; 
+                                            }
                                         }
                                     }
                                 }
@@ -461,10 +521,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ----------------------------------------------------------------
-    // 5. 归还终端
+    // 5. 归还终端 
     // ----------------------------------------------------------------
+    running.store(false, Ordering::SeqCst); 
+    std::thread::sleep(Duration::from_millis(40)); 
+
+    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    
     println!("=== RustyShark 已安全退出 ===");
     Ok(())
 }
