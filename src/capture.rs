@@ -1,17 +1,21 @@
+use crate::error::SnifferError;
 use pcap::{Capture, Device};
 use tokio::sync::mpsc;
-use crate::error::SnifferError;
 
 pub struct CaptureEngine;
 
 impl CaptureEngine {
     //  升级接口：增加 filter_str 参数接收过滤规则字符串
-    pub fn start_capture(device_name: &str, filter_str: &str, tx: mpsc::Sender<Vec<u8>>) -> Result<(), SnifferError> {
+    pub fn start_capture(
+        device_name: &str,
+        filter_str: &str,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), SnifferError> {
         // 查找指定网卡
-       let main_device = Device::list()?
-        .into_iter()
-        .find(|d| d.name == device_name)
-        .ok_or(SnifferError::DeviceNotFound)?;
+        let main_device = Device::list()?
+            .into_iter()
+            .find(|d| d.name == device_name)
+            .ok_or(SnifferError::DeviceNotFound)?;
 
         // 打开网卡设备激活抓包
         let mut cap = Capture::from_device(main_device)?
@@ -29,7 +33,7 @@ impl CaptureEngine {
         // 开辟独立线程循环抓包
         std::thread::spawn(move || {
             // 彻底移除此行的打印，防止破坏精美的全屏 TUI 面板
-            
+
             loop {
                 match cap.next_packet() {
                     Ok(packet) => {
